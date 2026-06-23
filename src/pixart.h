@@ -34,6 +34,9 @@ struct pixart_data {
 
     bool                         ready; // whether init is finished successfully
     int                          err; // error code during async init
+
+    uint32_t                     health_check_count;
+    struct k_work_delayable      health_work;
 };
 
 // device config data structure

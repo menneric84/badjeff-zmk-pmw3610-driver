@@ -17,6 +17,9 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(pmw3610, CONFIG_PMW3610_ALT_LOG_LEVEL);
 
+#define HEALTH_CHECK_REPORT_INTERVAL 16
+#define HEALTH_CHECK_WATCHDOG_MS 2000
+
 //////// Sensor initialization steps definition //////////
 // init is done in non-blocking manner (i.e., async), a //
 // delayable work is defined for this purpose           //
@@ -399,6 +402,50 @@ static int pmw3610_async_init_configure(const struct device *dev) {
     return 0;
 }
 
+static int pmw3610_force_reinit(const struct device *dev) {
+    struct pixart_data *data = dev->data;
+    int err;
+
+    LOG_WRN("Forcing sensor reinit");
+
+    data->ready = false;
+    pmw3610_set_interrupt(dev, false);
+
+    err = pmw3610_write_reg(dev, PMW3610_REG_POWER_UP_RESET, PMW3610_POWERUP_CMD_RESET);
+    if (err) {
+        LOG_ERR("Reinit: power-up reset write failed");
+        return err;
+    }
+
+    k_sleep(K_MSEC(10 + CONFIG_PMW3610_ALT_INIT_POWER_UP_EXTRA_DELAY_MS));
+
+    err = pmw3610_async_init_clear_ob1(dev);
+    if (err) {
+        LOG_ERR("Reinit: clear OB1 failed");
+        return err;
+    }
+
+    k_sleep(K_MSEC(200));
+
+    err = pmw3610_async_init_check_ob1(dev);
+    if (err) {
+        LOG_ERR("Reinit: self-test / product ID failed");
+        return err;
+    }
+
+    k_sleep(K_MSEC(50));
+
+    err = pmw3610_async_init_configure(dev);
+    if (err) {
+        LOG_ERR("Reinit: configure failed");
+        return err;
+    }
+
+    data->ready = true;
+    LOG_INF("Sensor reinit successful");
+    return 0;
+}
+
 static void pmw3610_async_init(struct k_work *work) {
     struct k_work_delayable *work2 = (struct k_work_delayable *)work;
     struct pixart_data *data = CONTAINER_OF(work2, struct pixart_data, init_work);
@@ -438,9 +485,21 @@ static int pmw3610_report_data(const struct device *dev) {
 
 	int err = pmw3610_read(dev, PMW3610_REG_MOTION_BURST, buf, PMW3610_BURST_SIZE);
     if (err) {
-        return err;
+        LOG_WRN("Burst read failed, attempting reinit");
+        return pmw3610_force_reinit(dev);
     }
-    // LOG_HEXDUMP_DBG(buf, PMW3610_BURST_SIZE, "buf");
+
+    data->health_check_count++;
+    if (data->health_check_count >= HEALTH_CHECK_REPORT_INTERVAL) {
+        data->health_check_count = 0;
+        uint8_t product_id;
+        int id_err = pmw3610_read_reg(dev, PMW3610_REG_PRODUCT_ID, &product_id);
+        if (id_err || product_id != PMW3610_PRODUCT_ID) {
+            LOG_WRN("Health check failed (id=0x%x), reinitializing",
+                    id_err ? 0xFF : product_id);
+            return pmw3610_force_reinit(dev);
+        }
+    }
 
 // 12-bit two's complement value to int16_t
 // adapted from https://stackoverflow.com/questions/70802306/convert-a-12-bit-signed-number-in-c
@@ -517,8 +576,30 @@ static void pmw3610_gpio_callback(const struct device *gpiob, struct gpio_callba
 static void pmw3610_work_callback(struct k_work *work) {
     struct pixart_data *data = CONTAINER_OF(work, struct pixart_data, trigger_work);
     const struct device *dev = data->dev;
-    pmw3610_report_data(dev);
-    pmw3610_set_interrupt(dev, true);
+    int err = pmw3610_report_data(dev);
+    if (err >= 0) {
+        pmw3610_set_interrupt(dev, true);
+    }
+}
+
+static void pmw3610_health_work_handler(struct k_work *work) {
+    struct k_work_delayable *dwork = CONTAINER_OF(work, struct k_work_delayable, work);
+    struct pixart_data *data = CONTAINER_OF(dwork, struct pixart_data, health_work);
+    const struct device *dev = data->dev;
+
+    if (data->ready) {
+        uint8_t product_id;
+        int err = pmw3610_read_reg(dev, PMW3610_REG_PRODUCT_ID, &product_id);
+        if (err || product_id != PMW3610_PRODUCT_ID) {
+            LOG_WRN("Watchdog: sensor unresponsive (id=0x%x), reinitializing",
+                    err ? 0xFF : product_id);
+            if (pmw3610_force_reinit(dev) == 0) {
+                pmw3610_set_interrupt(dev, true);
+            }
+        }
+    }
+
+    k_work_schedule(&data->health_work, K_MSEC(HEALTH_CHECK_WATCHDOG_MS));
 }
 
 static int pmw3610_init_irq(const struct device *dev) {
@@ -589,6 +670,10 @@ static int pmw3610_init(const struct device *dev) {
     k_work_init_delayable(&data->init_work, pmw3610_async_init);
 
     k_work_schedule(&data->init_work, K_MSEC(async_init_delay[data->async_init_step]));
+
+    data->health_check_count = 0;
+    k_work_init_delayable(&data->health_work, pmw3610_health_work_handler);
+    k_work_schedule(&data->health_work, K_MSEC(HEALTH_CHECK_WATCHDOG_MS));
 
     return err;
 }
