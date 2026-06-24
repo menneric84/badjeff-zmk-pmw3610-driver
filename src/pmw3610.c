@@ -17,8 +17,8 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(pmw3610, CONFIG_PMW3610_ALT_LOG_LEVEL);
 
-#define HEALTH_CHECK_REPORT_INTERVAL 16
 #define HEALTH_CHECK_WATCHDOG_MS 2000
+#define HEALTH_CHECK_FAIL_THRESHOLD 2
 
 //////// Sensor initialization steps definition //////////
 // init is done in non-blocking manner (i.e., async), a //
@@ -489,18 +489,6 @@ static int pmw3610_report_data(const struct device *dev) {
         return pmw3610_force_reinit(dev);
     }
 
-    data->health_check_count++;
-    if (data->health_check_count >= HEALTH_CHECK_REPORT_INTERVAL) {
-        data->health_check_count = 0;
-        uint8_t product_id;
-        int id_err = pmw3610_read_reg(dev, PMW3610_REG_PRODUCT_ID, &product_id);
-        if (id_err || product_id != PMW3610_PRODUCT_ID) {
-            LOG_WRN("Health check failed (id=0x%x), reinitializing",
-                    id_err ? 0xFF : product_id);
-            return pmw3610_force_reinit(dev);
-        }
-    }
-
 // 12-bit two's complement value to int16_t
 // adapted from https://stackoverflow.com/questions/70802306/convert-a-12-bit-signed-number-in-c
 #define TOINT16(val, bits) (((struct { int16_t value : bits; }){val}).value)
@@ -591,11 +579,21 @@ static void pmw3610_health_work_handler(struct k_work *work) {
         uint8_t product_id;
         int err = pmw3610_read_reg(dev, PMW3610_REG_PRODUCT_ID, &product_id);
         if (err || product_id != PMW3610_PRODUCT_ID) {
-            LOG_WRN("Watchdog: sensor unresponsive (id=0x%x), reinitializing",
+            /* Debounce: the probe shares the SPI bus it's testing, so a single
+             * bad read can be a transient. Only reinit after consecutive
+             * failures to avoid disruptive false-positive recoveries. */
+            data->health_check_count++;
+            LOG_WRN("Watchdog: probe failed %u/%u (id=0x%x)",
+                    data->health_check_count, HEALTH_CHECK_FAIL_THRESHOLD,
                     err ? 0xFF : product_id);
-            if (pmw3610_force_reinit(dev) == 0) {
-                pmw3610_set_interrupt(dev, true);
+            if (data->health_check_count >= HEALTH_CHECK_FAIL_THRESHOLD) {
+                data->health_check_count = 0;
+                if (pmw3610_force_reinit(dev) == 0) {
+                    pmw3610_set_interrupt(dev, true);
+                }
             }
+        } else {
+            data->health_check_count = 0;
         }
     }
 
