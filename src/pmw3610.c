@@ -20,6 +20,11 @@ LOG_MODULE_REGISTER(pmw3610, CONFIG_PMW3610_ALT_LOG_LEVEL);
 #define HEALTH_CHECK_WATCHDOG_MS 2000
 #define HEALTH_CHECK_FAIL_THRESHOLD 2
 
+/* Max plausible per-sample delta (counts). A corrupted SPI read can return a
+ * near-full-scale 12-bit value (~2047); real movement never approaches this in
+ * one sample. Deltas beyond this are treated as glitches and dropped. */
+#define PMW3610_MAX_SANE_DELTA 500
+
 //////// Sensor initialization steps definition //////////
 // init is done in non-blocking manner (i.e., async), a //
 // delayable work is defined for this purpose           //
@@ -496,6 +501,15 @@ static int pmw3610_report_data(const struct device *dev) {
     int16_t x = TOINT16((buf[PMW3610_X_L_POS] + ((buf[PMW3610_XY_H_POS] & 0xF0) << 4)), 12);
     int16_t y = TOINT16((buf[PMW3610_Y_L_POS] + ((buf[PMW3610_XY_H_POS] & 0x0F) << 8)), 12);
     LOG_DBG("x/y: %d/%d", x, y);
+
+    /* Spike filter: drop a single corrupted read (near-full-scale delta) that
+     * would otherwise teleport the cursor across the screen. Sustained desync
+     * is handled separately by the watchdog reinit. */
+    if (x > PMW3610_MAX_SANE_DELTA || x < -PMW3610_MAX_SANE_DELTA ||
+        y > PMW3610_MAX_SANE_DELTA || y < -PMW3610_MAX_SANE_DELTA) {
+        LOG_WRN("Discarding implausible delta x=%d y=%d (SPI glitch)", x, y);
+        return 0;
+    }
 
 #ifdef CONFIG_PMW3610_ALT_SMART_ALGORITHM
     int16_t shutter = ((int16_t)(buf[PMW3610_SHUTTER_H_POS] & 0x01) << 8) 
