@@ -20,10 +20,11 @@ LOG_MODULE_REGISTER(pmw3610, CONFIG_PMW3610_ALT_LOG_LEVEL);
 #define HEALTH_CHECK_WATCHDOG_MS 2000
 #define HEALTH_CHECK_FAIL_THRESHOLD 2
 
-/* Max plausible per-sample delta (counts). A corrupted SPI read can return a
- * near-full-scale 12-bit value (~2047); real movement never approaches this in
- * one sample. Deltas beyond this are treated as glitches and dropped. */
-#define PMW3610_MAX_SANE_DELTA 500
+/* Max plausible movement (counts) for a single read AND for one accumulated
+ * report. Real movement never approaches this at 600 CPI; larger values are
+ * SPI glitches and are dropped. Applied at both the per-sample and the
+ * post-accumulation (reported) stage so accumulated glitches can't slip past. */
+#define PMW3610_MAX_SANE_DELTA 300
 
 //////// Sensor initialization steps definition //////////
 // init is done in non-blocking manner (i.e., async), a //
@@ -547,6 +548,18 @@ static int pmw3610_report_data(const struct device *dev) {
     // fetch report value
     int16_t rx = (int16_t)CLAMP(data->dx, INT16_MIN, INT16_MAX);
     int16_t ry = (int16_t)CLAMP(data->dy, INT16_MIN, INT16_MAX);
+
+    /* Hard cap on what reaches the host. The per-sample filter above misses
+     * glitches built up across accumulated reads, so bound the reported value
+     * too: a single report can never move the cursor more than this. */
+    if (rx > PMW3610_MAX_SANE_DELTA || rx < -PMW3610_MAX_SANE_DELTA ||
+        ry > PMW3610_MAX_SANE_DELTA || ry < -PMW3610_MAX_SANE_DELTA) {
+        LOG_WRN("Discarding implausible report rx=%d ry=%d (SPI glitch)", rx, ry);
+        data->dx = 0;
+        data->dy = 0;
+        return 0;
+    }
+
     bool have_x = rx != 0;
     bool have_y = ry != 0;
 
