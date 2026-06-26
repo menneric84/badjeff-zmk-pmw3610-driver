@@ -21,10 +21,10 @@ LOG_MODULE_REGISTER(pmw3610, CONFIG_PMW3610_ALT_LOG_LEVEL);
 #define HEALTH_CHECK_FAIL_THRESHOLD 2
 
 /* Max plausible movement (counts) for a single read AND for one accumulated
- * report. Real movement never approaches this at 600 CPI; larger values are
- * SPI glitches and are dropped. Applied at both the per-sample and the
- * post-accumulation (reported) stage so accumulated glitches can't slip past. */
-#define PMW3610_MAX_SANE_DELTA 300
+ * report. Set high enough that only a true full-scale (~2047) SPI glitch is
+ * dropped and legitimate fast flicks are never clipped. Applied at both the
+ * per-sample and post-accumulation (reported) stage. */
+#define PMW3610_MAX_SANE_DELTA 1000
 
 //////// Sensor initialization steps definition //////////
 // init is done in non-blocking manner (i.e., async), a //
